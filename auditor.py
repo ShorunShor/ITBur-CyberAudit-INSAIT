@@ -225,7 +225,7 @@ class ITBurCyberAuditor:
                                      f"Версия {ver} (не найдена в базе уязвимостей)",
                                      f"sudo apt upgrade {pkg} (рекомендуется обновить)")
 
-    # ---------- БЛОК 4: Поиск CTF-флагов () ----------
+    # ---------- БЛОК 4: Поиск CTF-флагов (bit26) ----------
     def search_ctf_flags(self):
         """Многоуровневый поиск флагов bit26{...} во всех местах, где ты находил"""
         print(f"\n{Colors.BOLD}{Colors.MAGENTA}[4] Поиск CTF-флагов{Colors.END}")
