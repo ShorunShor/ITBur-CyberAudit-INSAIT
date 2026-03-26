@@ -1,0 +1,38 @@
+import subprocess
+import json
+
+def check_cve_vulnerabilities():
+    """Запускает debsecan и возвращает список CVE-уязвимостей для установленных пакетов."""
+    findings = []
+    try:
+        # Запускаем debsecan с выводом в формате JSON (доступно в новых версиях)
+        # Если JSON не поддерживается, можно парсить текстовый вывод.
+        result = subprocess.run(['debsecan', '--format=json'], capture_output=True, text=True, timeout=60)
+        if result.returncode == 0 and result.stdout:
+            cve_data = json.loads(result.stdout)
+            for entry in cve_data:
+                findings.append({
+                    'уровень': 'ВЫСОКИЙ',   # или 'КРИТИЧЕСКИЙ' в зависимости от severity
+                    'категория': 'CVE уязвимость',
+                    'описание': f"Пакет {entry['package']} ({entry['version']}) уязвим: {entry['cve']} - {entry.get('description', 'нет описания')}",
+                    'исправление': f"Обновите пакет: sudo apt update && sudo apt upgrade {entry['package']}",
+                    'данные': {'cve': entry['cve'], 'package': entry['package']}
+                })
+    except FileNotFoundError:
+        # debsecan не установлен
+        findings.append({
+            'уровень': 'ИНФО',
+            'категория': 'CVE проверка',
+            'описание': 'Утилита debsecan не найдена. Установите её для проверки CVE: sudo apt install debsecan',
+            'исправление': 'sudo apt install debsecan',
+            'данные': {}
+        })
+    except Exception as e:
+        findings.append({
+            'уровень': 'ИНФО',
+            'категория': 'CVE проверка',
+            'описание': f'Ошибка при выполнении debsecan: {e}',
+            'исправление': 'Проверьте установку и права доступа',
+            'данные': {}
+        })
+    return findings
