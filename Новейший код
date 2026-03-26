@@ -1,0 +1,1119 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+ITBur Cyber Auditor v6.3 – Финальная версия с улучшенными статусами проверок
+Автоматический аудит безопасности Linux-системы.
+Поддерживает CLI и GUI режимы с максимальной русификацией.
+"""
+
+import os
+import sys
+import subprocess
+import json
+import re
+import sqlite3
+import glob
+import shutil
+import signal
+import socket
+import argparse
+import threading
+import time
+from datetime import datetime
+from collections import defaultdict
+from packaging import version
+
+# ---------- Проверка наличия tabulate (опционально) ----------
+try:
+    from tabulate import tabulate
+    HAS_TABULATE = True
+except ImportError:
+    HAS_TABULATE = False
+
+# ---------- Цвета для консольного вывода ----------
+class Colors:
+    RED = '\033[91m'
+    GREEN = '\033[92m'
+    YELLOW = '\033[93m'
+    BLUE = '\033[94m'
+    MAGENTA = '\033[95m'
+    CYAN = '\033[96m'
+    BOLD = '\033[1m'
+    END = '\033[0m'
+
+# ---------- Конфигурация ----------
+EXCLUDE_DIRS = {
+    '/proc', '/sys', '/dev', '/run', '/tmp', '/var/tmp',
+    '/home/*/.cache', '/root/.cache', '/home/*/.local/share/Trash',
+    '/var/lib/postgresql',  # исключаем бинарные файлы БД
+}
+EXCLUDE_EXTENSIONS = {'.qmlc', '.jsc', '.shm', '.wal', '.db', '.cache', '.pyc', '.so', '.o'}
+SAFE_SUID = {
+    '/usr/bin/passwd', '/usr/bin/sudo', '/usr/bin/chsh', '/usr/bin/chfn', '/usr/bin/gpasswd'
+}
+# Расширенный список опасных портов
+DANGEROUS_PORTS = {
+    21:   'FTP (Протокол передачи файлов)',
+    22:   'SSH (Безопасная оболочка)',
+    23:   'Telnet (Небезопасный удалённый доступ)',
+    25:   'SMTP (Электронная почта)',
+    80:   'HTTP (Незащищённый веб-сервер)',
+    111:  'RPC (Удалённый вызов процедур)',
+    139:  'NetBIOS (Сетевая файловая система)',
+    443:  'HTTPS (Шифрованный веб-сервер)',
+    445:  'SMB (Сетевая файловая система Windows)',
+    2049: 'NFS (Сетевая файловая система)',
+    3306: 'MySQL (Система управления базами данных)',
+    3389: 'RDP (Удалённый рабочий стол)',
+    5432: 'PostgreSQL (Объектно-реляционная СУБД)',
+    5900: 'VNC (Удалённый графический доступ)',
+    6379: 'Redis (Хранилище структур данных)',
+    27017:'MongoDB (Документоориентированная СУБД)'
+}
+VULN_DB = {
+    'openssh-server': [('1:', 'CVE-2024-6387'), ('8.9', 'CVE-2023-38408'), ('7.9', 'CVE-2021-28041')],
+    'apache2': [('2.4.49', 'CVE-2021-42013'), ('2.4.50', 'CVE-2021-42013')],
+    'nginx': [('1.20.0', 'CVE-2021-23017'), ('1.18.0', 'CVE-2021-23017')],
+    'mysql-server': [('5.7', 'CVE-2023-21912'), ('8.0.36', 'CVE-2024-20973')],
+    'mariadb-server': [('10.3', 'CVE-2021-27928'), ('10.4', 'CVE-2021-27928')],
+    'postgresql': [('14', 'CVE-2023-2454'), ('15', 'CVE-2023-2455')],
+    'vsftpd': [('2.3.4', 'CVE-2011-2523')],
+    'samba': [('4.17', 'CVE-2023-3347'), ('4.18', 'CVE-2023-3347')],
+    'openssl': [('1.1.1', 'CVE-2023-3817'), ('3.0', 'CVE-2023-3817')],
+    'php': [('7.4', 'CVE-2022-31628'), ('8.0', 'CVE-2022-31628')],
+    'redis': [('6.2', 'CVE-2022-24736'), ('7.0', 'CVE-2022-24736')],
+}
+
+# ---------- Расшифровка аббревиатур ----------
+ABBREVIATIONS = {
+    "GUI": "Графический интерфейс пользователя",
+    "CLI": "Интерфейс командной строки",
+    "CVE": "Общая уязвимость и экспозиция",
+    "SUID": "Бит смены пользователя при выполнении",
+    "SGID": "Бит смены группы при выполнении",
+    "UFW": "Несложный брандмауэр",
+    "FTP": "Протокол передачи файлов",
+    "SSH": "Безопасная оболочка",
+    "JSON": "Объектная нотация JavaScript",
+    "API": "Программный интерфейс приложения",
+    "SQL": "Язык структурированных запросов",
+    "SQLite": "Встраиваемая реляционная база данных",
+    "Redis": "Сервер удалённого словаря",
+    "MongoDB": "Документоориентированная база данных",
+    "PostgreSQL": "Объектно-реляционная СУБД",
+    "MySQL": "Система управления реляционными базами данных",
+    "MariaDB": "Ответвление от MySQL",
+    "bit26": "Формат флага в CTF-соревнованиях",
+    "IT": "Информационные технологии",
+    "DevSecOps": "Разработка, безопасность и эксплуатация"
+}
+
+# ---------- ASCII-баннер ----------
+BANNER = f"""
+{Colors.CYAN}{Colors.BOLD}
+╔════════════════════════════════════════════════════════════════╗
+║                   ITBur Cyber Auditor v6.3                     ║
+║              Автоматический аудит безопасности Linux           ║
+║                 Русскоязычный интерфейс и отчёты               ║
+╚════════════════════════════════════════════════════════════════╝
+{Colors.END}
+"""
+
+# ---------- Основной класс аудитора ----------
+class ITBurCyberAuditor:
+    VERSION = "6.3"
+
+    def __init__(self, no_color=False, gui_callback=None):
+        self.находки = []
+        self.флаги = set()
+        self.нерасшифрованные_флаги = []
+        self.подсказки_ctf = defaultdict(list)
+        self.ошибки = []
+        self.время_старта = datetime.now()
+        self.имя_хоста = subprocess.getoutput("hostname")
+        self.текущий_пользователь = subprocess.getoutput("whoami")
+        self._добавленные_проблемы = set()
+        self.статус_проверок = {}  # название_проверки: (статус_строка, пояснение)
+
+        self.интернет_доступен = self._проверить_интернет()
+        self.no_color = no_color
+        self.gui_callback = gui_callback   # функция для отправки сообщений в GUI
+
+    # ---------- Вспомогательные методы ----------
+    def _log(self, message, color=None):
+        """Вывод в консоль и/или GUI"""
+        if self.gui_callback:
+            self.gui_callback(message)
+        if not self.no_color and color:
+            print(f"{color}{message}{Colors.END}")
+        else:
+            print(message)
+
+    def _проверить_интернет(self):
+        try:
+            socket.create_connection(("8.8.8.8", 53), timeout=3)
+            return True
+        except OSError:
+            return False
+
+    def _есть_утилита(self, имя):
+        return shutil.which(имя) is not None
+
+    def выполнить_команду(self, аргументы, использовать_sudo=False):
+        try:
+            if использовать_sudo and self.текущий_пользователь != 'root':
+                аргументы = ['sudo'] + аргументы
+            результат = subprocess.run(аргументы, capture_output=True, text=True, timeout=60)
+            return результат.stdout.strip()
+        except Exception as e:
+            self.ошибки.append(f"Ошибка при выполнении {' '.join(аргументы)}: {str(e)}")
+            return ""
+
+    def добавить_находку(self, уровень, категория, описание, исправление, данные=None):
+        ключ = f"{уровень}|{категория}|{описание}"
+        if ключ in self._добавленные_проблемы:
+            return
+        self._добавленные_проблемы.add(ключ)
+        запись = {
+            'уровень': уровень,
+            'категория': категория,
+            'описание': описание,
+            'исправление': исправление,
+            'данные': данные or {}
+        }
+        self.находки.append(запись)
+        цвета = {
+            'КРИТИЧЕСКИЙ': Colors.RED,
+            'ВЫСОКИЙ': Colors.YELLOW,
+            'СРЕДНИЙ': Colors.BLUE,
+            'ИНФО': Colors.CYAN
+        }
+        цвет = цвета.get(уровень, Colors.END)
+        self._log(f"{цвет}[{уровень}]{Colors.END} {категория}: {описание}")
+        self._log(f"  → Исправление: {исправление}\n")
+
+    def _исключён(self, путь):
+        путь_стр = str(путь)
+        if any(путь_стр.startswith(д) for д in EXCLUDE_DIRS if '*' not in д):
+            return True
+        if any(шаблон in путь_стр for шаблон in ['.cache', '.local/share/Trash']):
+            return True
+        if any(путь_стр.endswith(расш) for расш in EXCLUDE_EXTENSIONS):
+            return True
+        if 'auditor' in путь_стр and (путь_стр.endswith('.py') or путь_стр.endswith('.pyc')):
+            return True
+        return False
+
+    def _отметить_статус(self, название, успех, пояснение="", частично=False):
+        """
+        Установка статуса проверки.
+        успех: True – полностью успешно, False – не выполнено или частично.
+        частично: True – статус будет "частично выполнено" (если успех=False).
+        """
+        if успех:
+            статус = "✅ выполнено"
+        elif частично:
+            статус = "⚠️ частично выполнено"
+        else:
+            статус = "❌ не выполнено"
+        if not успех and not частично and not пояснение:
+            пояснение = "неизвестная причина"
+        self.статус_проверок[название] = (статус, пояснение)
+
+    # ---------- 1. Анализ прав доступа ----------
+    def аудит_прав(self):
+        self._log(f"\n{Colors.BOLD}{Colors.BLUE}[1] Анализ прав доступа{Colors.END}")
+        успех = True
+        ошибки_здесь = []
+        try:
+            критические_папки = ['/etc', '/var/www', '/root', '/opt']
+            for старт in критические_папки:
+                if not os.path.exists(старт):
+                    continue
+                for корень, папки, файлы in os.walk(старт, topdown=True):
+                    папки[:] = [п for п in папки if not self._исключён(os.path.join(корень, п))]
+                    for имя in файлы:
+                        путь = os.path.join(корень, имя)
+                        if self._исключён(путь):
+                            continue
+                        try:
+                            стат = os.stat(путь)
+                        except Exception:
+                            continue
+                        режим = стат.st_mode & 0o7777
+                        if режим & 0o777 == 0o777:
+                            self.добавить_находку('КРИТИЧЕСКИЙ', 'Права 777',
+                                                  f"Файл {путь} доступен всем",
+                                                  f"sudo chmod 644 {путь}")
+                        elif режим & 0o666 == 0o666:
+                            self.добавить_находку('ВЫСОКИЙ', 'Права 666',
+                                                  f"Файл {путь} доступен на запись всем",
+                                                  f"sudo chmod 644 {путь}")
+                        if режим & 0o4000 and путь not in SAFE_SUID:
+                            self.добавить_находку('ВЫСОКИЙ', 'SUID-бит',
+                                                  f"Файл {путь} имеет SUID (бит смены пользователя)",
+                                                  f"sudo chmod u-s {путь}")
+                        if режим & 0o2000:
+                            self.добавить_находку('СРЕДНИЙ', 'SGID-бит',
+                                                  f"Файл {путь} имеет SGID (бит смены группы)",
+                                                  f"sudo chmod g-s {путь}")
+
+            # Поиск конфиденциальных данных
+            self._log(f"{Colors.BLUE}  Поиск конфиденциальных данных...{Colors.END}")
+            паттерны = ['password', 'passwd', 'secret', 'key', 'cred', 'IDENTIFIED BY']
+            for старт in ['/etc', '/var', '/home']:
+                if not os.path.exists(старт):
+                    continue
+                for корень, папки, файлы in os.walk(старт):
+                    папки[:] = [п for п in папки if not self._исключён(os.path.join(корень, п))]
+                    for имя in файлы:
+                        путь = os.path.join(корень, имя)
+                        if self._исключён(путь) or not os.access(путь, os.R_OK):
+                            continue
+                        if os.path.getsize(путь) > 10*1024*1024:
+                            continue
+                        try:
+                            with open(путь, 'r', errors='ignore') as f:
+                                содержимое = f.read(200*1024)
+                                for пат in паттерны:
+                                    if пат.lower() in содержимое.lower():
+                                        idx = содержимое.lower().find(пат.lower())
+                                        фрагмент = содержимое[max(0, idx-30):min(len(содержимое), idx+70)]
+                                        self.добавить_находку('ВЫСОКИЙ', 'Конфиденциальные данные',
+                                                              f"Файл {путь} содержит '{пат}': {фрагмент}",
+                                                              f"Проверьте содержимое: cat {путь}")
+                                        break
+                        except Exception:
+                            continue
+
+            # История БД
+            файлы_истории = [os.path.expanduser("~/.mariadb_history"), "/root/.mariadb_history",
+                             os.path.expanduser("~/.mysql_history"), "/root/.mysql_history"]
+            for путь in файлы_истории:
+                if os.path.exists(путь):
+                    self.добавить_находку('ВЫСОКИЙ', 'История БД',
+                                          f"Найден файл истории БД: {путь} (может содержать пароли)",
+                                          f"Удалите или очистите: sudo rm {путь}")
+
+            # Ярлыки меню
+            десктоп_файлы = glob.glob('/usr/share/applications/*.desktop')
+            подозрительные = []
+            for дф in десктоп_файлы:
+                try:
+                    with open(дф, 'r', errors='ignore') as f:
+                        if 'pkexec' in f.read() or 'sudo' in f.read():
+                            подозрительные.append(дф)
+                except Exception:
+                    continue
+            if подозрительные:
+                self.добавить_находку('СРЕДНИЙ', 'Ярлыки меню',
+                                      f"Найдены ярлыки запуска от root: {', '.join(подозрительные)}",
+                                      "Проверьте файл /etc/sudoers и правила Polkit")
+        except Exception as e:
+            успех = False
+            ошибки_здесь.append(str(e))
+        if успех:
+            self._отметить_статус("Анализ прав доступа", True, "")
+        elif ошибки_здесь:
+            self._отметить_статус("Анализ прав доступа", False, "; ".join(ошибки_здесь), частично=True)
+        else:
+            self._отметить_статус("Анализ прав доступа", False, "")
+
+    # ---------- 2. Сетевой аудит ----------
+    def аудит_сети(self):
+        self._log(f"\n{Colors.BOLD}{Colors.BLUE}[2] Сетевой аудит{Colors.END}")
+        успех = True
+        ошибки_здесь = []
+        открытые_порты = []
+        есть_выполненные = False
+        try:
+            if not self._есть_утилита('ss'):
+                сообщение = "Утилита ss не найдена, сканирование портов пропущено. Установите iproute2 (sudo apt install iproute2)."
+                self.ошибки.append(сообщение)
+                self.добавить_находку('ИНФО', 'Сетевой аудит', "ss не установлен, проверка портов невозможна",
+                                      "Установите iproute2")
+                ошибки_здесь.append(сообщение)
+            else:
+                вывод = self.выполнить_команду(['ss', '-tulpn'])
+                for строка in вывод.splitlines():
+                    совпадение = re.search(r'LISTEN\s+\d+\s+\d+\s+(?:[0-9.]+|\[::\]):(\d+)', строка)
+                    if not совпадение:
+                        continue
+                    порт = int(совпадение.group(1))
+                    if порт in DANGEROUS_PORTS:
+                        self.добавить_находку('ВЫСОКИЙ', 'Опасный порт',
+                                              f"Порт {порт} ({DANGEROUS_PORTS[порт]}) открыт",
+                                              f"sudo ufw deny {порт} или остановите сервис",
+                                              {'порт': порт})
+                        открытые_порты.append((порт, DANGEROUS_PORTS[порт]))
+                есть_выполненные = True
+
+            # Баннеры через nc
+            if not self._есть_утилита('nc'):
+                сообщение = "nc не установлен, проверка баннеров пропущена. Установите netcat (sudo apt install netcat)."
+                self.ошибки.append(сообщение)
+                self.добавить_находку('ИНФО', 'Сетевой аудит', "nc не установлен, баннеры не проверялись",
+                                      "Установите netcat")
+                ошибки_здесь.append(сообщение)
+            else:
+                for порт in [21, 25, 80, 443, 3306, 5432]:
+                    баннер = self.выполнить_команду(['timeout', '2', 'nc', '-v', 'localhost', str(порт)], использовать_sudo=False)
+                    if 'bit26{' in баннер:
+                        флаг = re.search(r'(bit26\{[^}]+\})', баннер)
+                        if флаг:
+                            self.флаги.add(флаг.group(1))
+                            self._log(f"{Colors.GREEN}[+] Флаг в баннере порта {порт}: {флаг.group(1)}{Colors.END}")
+                есть_выполненные = True
+
+            # FTP анонимный доступ
+            if not self._есть_утилита('ftp'):
+                сообщение = "ftp не установлен, проверка анонимного FTP пропущена. Установите ftp-клиент (sudo apt install ftp)."
+                self.ошибки.append(сообщение)
+                self.добавить_находку('ИНФО', 'Сетевой аудит', "ftp не установлен, проверка FTP невозможна",
+                                      "Установите ftp-клиент")
+                ошибки_здесь.append(сообщение)
+            else:
+                ftp_тест = self.выполнить_команду("echo 'quit' | ftp -n localhost 2>/dev/null | grep -E '230 |220 '", использовать_sudo=False)
+                if ftp_тест:
+                    self.добавить_находку('КРИТИЧЕСКИЙ', 'FTP анонимный доступ',
+                                          "Анонимный вход разрешён",
+                                          "Отключите anonymous_enable в /etc/vsftpd.conf")
+                есть_выполненные = True
+
+            # Вывод таблицы открытых портов, если есть
+            if открытые_порты and HAS_TABULATE:
+                self._log(f"\n{Colors.BOLD}Обнаруженные открытые порты:{Colors.END}")
+                таблица = tabulate(открытые_порты, headers=["Порт", "Сервис (расшифровка)"], tablefmt="grid")
+                self._log(таблица)
+
+            if есть_выполненные and ошибки_здесь:
+                self._отметить_статус("Сетевой аудит", False, "; ".join(ошибки_здесь), частично=True)
+            elif not есть_выполненные and ошибки_здесь:
+                self._отметить_статус("Сетевой аудит", False, "; ".join(ошибки_здесь))
+            else:
+                self._отметить_статус("Сетевой аудит", True, "")
+        except Exception as e:
+            self._отметить_статус("Сетевой аудит", False, str(e))
+
+    # ---------- 3. Аудит пакетов ----------
+    def аудит_пакетов(self):
+        self._log(f"\n{Colors.BOLD}{Colors.BLUE}[3] Аудит пакетов{Colors.END}")
+        успех = True
+        ошибки_здесь = []
+        уязвимые_пакеты = []
+        try:
+            ядро = self.выполнить_команду(['uname', '-r'])
+            self.добавить_находку('ИНФО', 'Ядро Linux', f"Версия: {ядро}",
+                                  "sudo apt update && sudo apt upgrade linux-image")
+            
+            # 1) Проверка по статическому словарю VULN_DB
+            for пакет, версии in VULN_DB.items():
+                версия = self.выполнить_команду(['dpkg-query', '-W', '-f=${Version}', пакет])
+                if not версия:
+                    continue
+                for плохая_версия, cve in версии:
+                    try:
+                        if version.parse(версия) <= version.parse(плохая_версия):
+                            self.добавить_находку('КРИТИЧЕСКИЙ', f'Уязвимый пакет {пакет}',
+                                                  f"{пакет} {версия} — {cve}",
+                                                  f"sudo apt update && sudo apt upgrade {пакет}")
+                            уязвимые_пакеты.append((пакет, версия, cve))
+                            break
+                    except Exception:
+                        continue
+
+            # 2) Проверка через debsecan (более полная база CVE)
+            if self._есть_утилита('debsecan'):
+                self._log(f"{Colors.BLUE}  Выполняется проверка CVE через debsecan...{Colors.END}")
+                try:
+                    результат = subprocess.run(['debsecan', '--format=json'], capture_output=True, text=True, timeout=60)
+                    if результат.returncode == 0 and результат.stdout.strip():
+                        данные = json.loads(результат.stdout)
+                        # Формат вывода debsecan может быть списком объектов с полями package, version, cve
+                        for запись in данные:
+                            пакет = запись.get('package', '')
+                            версия = запись.get('version', '')
+                            cve = запись.get('cve', '')
+                            if пакет and cve:
+                                self.добавить_находку('КРИТИЧЕСКИЙ', f'Уязвимый пакет {пакет}',
+                                                      f"{пакет} {версия} — {cve} (по данным debsecan)",
+                                                      f"sudo apt update && sudo apt upgrade {пакет}")
+                                уязвимые_пакеты.append((пакет, версия, cve))
+                    else:
+                        self._log(f"{Colors.YELLOW}  debsecan не вернул данных (возможно, база пуста или нет интернета).{Colors.END}")
+                except Exception as e:
+                    self._log(f"{Colors.YELLOW}  Ошибка при выполнении debsecan: {e}{Colors.END}")
+                    self.ошибки.append(f"debsecan: {str(e)}")
+            else:
+                self._log(f"{Colors.YELLOW}  debsecan не установлен. Для расширенной проверки CVE установите: sudo apt install debsecan{Colors.END}")
+                self.добавить_находку('ИНФО', 'CVE проверка',
+                                      "Утилита debsecan не найдена, использована только локальная база",
+                                      "Установите debsecan: sudo apt install debsecan")
+
+            if уязвимые_пакеты and HAS_TABULATE:
+                self._log(f"\n{Colors.BOLD}Уязвимые пакеты (по локальной базе и/или debsecan):{Colors.END}")
+                таблица = tabulate(уязвимые_пакеты, headers=["Пакет", "Версия", "CVE"], tablefmt="grid")
+                self._log(таблица)
+
+        except Exception as e:
+            успех = False
+            ошибки_здесь.append(str(e))
+        if успех:
+            self._отметить_статус("Аудит пакетов", True, "")
+        elif ошибки_здесь:
+            self._отметить_статус("Аудит пакетов", False, "; ".join(ошибки_здесь), частично=True)
+        else:
+            self._отметить_статус("Аудит пакетов", False, "")
+
+    # ---------- 4. Поиск bit26-флагов (исправленный) ----------
+    def поиск_флагов(self):
+        self._log(f"\n{Colors.BOLD}{Colors.MAGENTA}[4] Поиск bit26-флагов{Colors.END}")
+        успех = True
+        ошибки_здесь = []
+        try:
+            # 4.1. Файловая система
+            пути_поиска = ['/home', '/root', '/var/www', '/etc', '/opt', '/boot', '/var/log']
+            for корень_поиска in пути_поиска:
+                if not os.path.exists(корень_поиска):
+                    continue
+                for корень, папки, файлы in os.walk(корень_поиска):
+                    папки[:] = [п for п in папки if not self._исключён(os.path.join(корень, п))]
+                    for имя in файлы:
+                        путь = os.path.join(корень, имя)
+                        if self._исключён(путь):
+                            continue
+                        try:
+                            with open(путь, 'r', errors='ignore') as f:
+                                содержимое = f.read(5*1024*1024)
+                                for совпад in re.finditer(r'(bit26\{[^}]+\})', содержимое):
+                                    флаг = совпад.group(1)
+                                    if len(флаг) > 7 and '...' not in флаг:
+                                        self.флаги.add(флаг)
+                                        self._log(f"{Colors.GREEN}[+] Флаг в файле: {флаг}{Colors.END}")
+                        except Exception:
+                            continue
+
+            # 4.2. Firefox
+            маски = [
+                '/home/*/.mozilla/firefox/*.default/places.sqlite',
+                '/home/*/.mozilla/firefox/*.default-release/places.sqlite',
+                '/home/*/.mozilla/firefox/*.default-esr/places.sqlite',
+            ]
+            for маска in маски:
+                for профиль in glob.glob(маска):
+                    try:
+                        conn = sqlite3.connect(f"file:{профиль}?mode=ro", uri=True)
+                        c = conn.cursor()
+                        c.execute("SELECT url, title FROM moz_places WHERE url LIKE '%bit26%' OR title LIKE '%bit26%'")
+                        for url, title in c.fetchall():
+                            for текст in [url, title]:
+                                совпад = re.search(r'(bit26\{[^}]+\})', str(текст))
+                                if совпад:
+                                    self.флаги.add(совпад.group(1))
+                                    self._log(f"{Colors.GREEN}[+] Флаг в Firefox: {совпад.group(1)}{Colors.END}")
+                        conn.close()
+                    except Exception:
+                        pass
+
+            # 4.3. История команд
+            история_файлы = []
+            for шаблон in ['/root/.bash_history', '/root/.zsh_history'] + \
+                          glob.glob('/home/*/.bash_history') + \
+                          glob.glob('/home/*/.zsh_history') + \
+                          glob.glob('/home/*/.local/share/fish/fish_history'):
+                история_файлы.append(шаблон)
+            for путь in история_файлы:
+                if os.path.exists(путь):
+                    try:
+                        with open(путь, 'r', errors='ignore') as f:
+                            for строка in f:
+                                совпад = re.search(r'(bit26\{[^}]+\})', строка)
+                                if совпад:
+                                    self.флаги.add(совпад.group(1))
+                                    self._log(f"{Colors.GREEN}[+] Флаг в истории команд: {совпад.group(1)}{Colors.END}")
+                    except Exception:
+                        pass
+
+            # 4.4. Переменные окружения
+            env_out = subprocess.getoutput("env")
+            for совпад in re.finditer(r'(bit26\{[^}]+\})', env_out):
+                self.флаги.add(совпад.group(1))
+                self._log(f"{Colors.GREEN}[+] Флаг в переменных окружения: {совпад.group(1)}{Colors.END}")
+
+            # 4.5. Cron
+            cron_out = self.выполнить_команду(['crontab', '-l'])
+            for совпад in re.finditer(r'(bit26\{[^}]+\})', cron_out):
+                self.флаги.add(совпад.group(1))
+                self._log(f"{Colors.GREEN}[+] Флаг в cron: {совпад.group(1)}{Colors.END}")
+
+            # 4.6. GRUB
+            if os.path.exists('/boot/grub/grub.cfg'):
+                try:
+                    with open('/boot/grub/grub.cfg', 'r', errors='ignore') as f:
+                        for совпад in re.finditer(r'(bit26\{[^}]+\})', f.read()):
+                            self.флаги.add(совпад.group(1))
+                            self._log(f"{Colors.GREEN}[+] Флаг в GRUB: {совпад.group(1)}{Colors.END}")
+                except Exception:
+                    pass
+
+            # 4.7. Базы данных
+            self._поиск_флагов_в_базах_данных()
+
+            # 4.8. journalctl
+            if not self._есть_утилита('journalctl'):
+                сообщение = "journalctl не найден, проверка системного журнала пропущена. Установите systemd."
+                self.ошибки.append(сообщение)
+                self.добавить_находку('ИНФО', 'Поиск флагов', "journalctl не установлен, системный журнал не проверен",
+                                      "Установите systemd")
+                ошибки_здесь.append(сообщение)
+            else:
+                журнал = self.выполнить_команду(['sudo', 'journalctl', '-n', '5000'], использовать_sudo=True)
+                for совпад in re.finditer(r'(bit26\{[^}]+\})', журнал):
+                    self.флаги.add(совпад.group(1))
+                    self._log(f"{Colors.GREEN}[+] Флаг в journalctl: {совпад.group(1)}{Colors.END}")
+
+            # 4.9. Шифрованные строки (нерасшифрованные флаги) – ИСПРАВЛЕННЫЙ БЛОК
+            шифрованные = self.выполнить_команду(['grep', '-r', '-E', 'СМИОТЗУИЯВРП|ОАТН|ИЬТУАСР', '/home', '/root'])
+            if шифрованные:
+                for строка in шифрованных.split('\n'):
+                    совпад = re.search(r'(СМИОТЗУИЯВРП|ОАТН|ИЬТУАСР)', строка)
+                    if совпад:
+                        подсказка = совпад.group(1)
+                        if подсказка not in self.нерасшифрованные_флаги:
+                            self.нерасшифрованные_флаги.append(подсказка)
+                self._log(f"{Colors.YELLOW}[!] Найдены зашифрованные строки (возможно, флаг после расшифровки):{Colors.END}")
+                for подсказка in self.нерасшифрованные_флаги:
+                    self._log(f"  {Colors.YELLOW}{подсказка}{Colors.END}")
+
+            # 4.10. Веб-сервер
+            веб_корень = '/var/www/html'
+            if os.path.exists(веб_корень):
+                for корень, папки, файлы in os.walk(веб_корень):
+                    for имя in файлы:
+                        путь = os.path.join(корень, имя)
+                        try:
+                            with open(путь, 'r', errors='ignore') as f:
+                                содержимое = f.read(5*1024*1024)
+                                for совпад in re.finditer(r'(bit26\{[^}]+\})', содержимое):
+                                    self.флаги.add(совпад.group(1))
+                                    self._log(f"{Colors.GREEN}[+] Флаг в веб-файле: {совпад.group(1)}{Colors.END}")
+                        except Exception:
+                            pass
+        except Exception as e:
+            успех = False
+            ошибки_здесь.append(str(e))
+        if успех:
+            self._отметить_статус("Поиск bit26-флагов", True, "")
+        elif ошибки_здесь:
+            self._отметить_статус("Поиск bit26-флагов", False, "; ".join(ошибки_здесь), частично=True)
+        else:
+            self._отметить_статус("Поиск bit26-флагов", False, "")
+
+    def _поиск_флагов_в_базах_данных(self):
+        """Проверка MySQL, PostgreSQL, Redis, MongoDB, SQLite"""
+        self._log(f"{Colors.BLUE}  Поиск флагов в базах данных...{Colors.END}")
+
+        # MySQL / MariaDB
+        if self._есть_утилита('mysql'):
+            try:
+                тест_бд = self.выполнить_команду(['mysql', '-u', 'root', '-e', 'show databases;'])
+                if 'information_schema' in тест_бд:
+                    for база in ['ctf', 'flags', 'test', 'cff', 'challenge']:
+                        for таблица in ['flag', 'flags', 'secrets']:
+                            запрос = f"select * from {таблица};"
+                            результат = self.выполнить_команду(['mysql', '-u', 'root', '-D', база, '-e', запрос])
+                            for совпад in re.finditer(r'(bit26\{[^}]+\})', результат):
+                                self.флаги.add(совпад.group(1))
+                                self._log(f"{Colors.GREEN}[+] Флаг в MySQL ({база}.{таблица}): {совпад.group(1)}{Colors.END}")
+                else:
+                    self._log(f"{Colors.YELLOW}  MySQL недоступен без пароля, проверка пропущена{Colors.END}")
+            except Exception as e:
+                self._log(f"{Colors.YELLOW}  Ошибка при подключении к MySQL: {e}{Colors.END}")
+        else:
+            self._log(f"{Colors.YELLOW}  Утилита mysql не установлена, проверка MySQL пропущена{Colors.END}")
+
+        # PostgreSQL
+        if self._есть_утилита('psql'):
+            try:
+                командная_строка = "psql -U postgres -d postgres -c \"SELECT table_schema, table_name FROM information_schema.tables WHERE table_name LIKE '%flag%' OR table_name LIKE '%secrets%';\""
+                результат = self.выполнить_команду(командная_строка, использовать_sudo=False)
+                if результат:
+                    for совпад in re.finditer(r'(bit26\{[^}]+\})', результат):
+                        self.флаги.add(совпад.group(1))
+                        self._log(f"{Colors.GREEN}[+] Флаг в PostgreSQL: {совпад.group(1)}{Colors.END}")
+                else:
+                    self._log(f"{Colors.YELLOW}  PostgreSQL недоступен без пароля, проверка пропущена{Colors.END}")
+            except Exception as e:
+                self._log(f"{Colors.YELLOW}  Ошибка при подключении к PostgreSQL: {e}{Colors.END}")
+        else:
+            self._log(f"{Colors.YELLOW}  Утилита psql не установлена, проверка PostgreSQL пропущена{Colors.END}")
+
+        # Redis
+        if self._есть_утилита('redis-cli'):
+            try:
+                ключи = self.выполнить_команду(['redis-cli', 'KEYS', '*'])
+                if ключи:
+                    for ключ in ключи.splitlines():
+                        значение = self.выполнить_команду(['redis-cli', 'GET', ключ])
+                        for совпад in re.finditer(r'(bit26\{[^}]+\})', значение):
+                            self.флаги.add(совпад.group(1))
+                            self._log(f"{Colors.GREEN}[+] Флаг в Redis (ключ {ключ}): {совпад.group(1)}{Colors.END}")
+                else:
+                    self._log(f"{Colors.YELLOW}  Redis не содержит ключей или недоступен{Colors.END}")
+            except Exception as e:
+                self._log(f"{Colors.YELLOW}  Ошибка при подключении к Redis: {e}{Colors.END}")
+        else:
+            self._log(f"{Colors.YELLOW}  Утилита redis-cli не установлена, проверка Redis пропущена{Colors.END}")
+
+        # MongoDB
+        if self._есть_утилита('mongo'):
+            try:
+                скрипт = "db.getMongo().getDBNames().forEach(function(dbName) { var db = db.getSiblingDB(dbName); db.getCollectionNames().forEach(function(collName) { var coll = db.getCollection(collName); coll.find().forEach(function(doc) { printjson(doc); }); }); });"
+                результат = self.выполнить_команду(['mongo', '--quiet', '--eval', скрипт])
+                for совпад in re.finditer(r'(bit26\{[^}]+\})', результат):
+                    self.флаги.add(совпад.group(1))
+                    self._log(f"{Colors.GREEN}[+] Флаг в MongoDB: {совпад.group(1)}{Colors.END}")
+                if not результат:
+                    self._log(f"{Colors.YELLOW}  MongoDB недоступен без авторизации или пуст{Colors.END}")
+            except Exception as e:
+                self._log(f"{Colors.YELLOW}  Ошибка при подключении к MongoDB: {e}{Colors.END}")
+        else:
+            self._log(f"{Colors.YELLOW}  Утилита mongo не установлена, проверка MongoDB пропущена{Colors.END}")
+
+        # SQLite (файлы баз данных)
+        sqlite_файлы = []
+        for корень in ['/', '/home', '/var', '/opt']:
+            for root, dirs, files in os.walk(корень):
+                for file in files:
+                    if file.endswith(('.db', '.sqlite', '.sqlite3')):
+                        путь = os.path.join(root, file)
+                        if not self._исключён(путь):
+                            sqlite_файлы.append(путь)
+        for путь in sqlite_файлы:
+            try:
+                conn = sqlite3.connect(f"file:{путь}?mode=ro", uri=True)
+                c = conn.cursor()
+                c.execute("SELECT name FROM sqlite_master WHERE type='table';")
+                таблицы = c.fetchall()
+                for табл in таблицы:
+                    try:
+                        c.execute(f"SELECT * FROM {табл[0]};")
+                        for строка in c.fetchall():
+                            for поле in строка:
+                                if isinstance(поле, str):
+                                    for совпад in re.finditer(r'(bit26\{[^}]+\})', поле):
+                                        self.флаги.add(совпад.group(1))
+                                        self._log(f"{Colors.GREEN}[+] Флаг в SQLite ({путь}, {табл[0]}): {совпад.group(1)}{Colors.END}")
+                    except:
+                        continue
+                conn.close()
+            except Exception:
+                pass
+
+    # ---------- 5. Проверка привилегий ----------
+    def проверка_привилегий(self):
+        self._log(f"\n{Colors.BOLD}{Colors.BLUE}[5] Проверка привилегий{Colors.END}")
+        успех = True
+        ошибки_здесь = []
+        try:
+            sudo_l = self.выполнить_команду(['sudo', '-l'])
+            if '(ALL : ALL) ALL' in sudo_l:
+                self.добавить_находку('КРИТИЧЕСКИЙ', 'Sudo ALL',
+                                      f"Пользователь {self.текущий_пользователь} имеет полный доступ sudo",
+                                      "Отредактируйте /etc/sudoers")
+            if re.search(r'NOPASSWD:\s*ALL', sudo_l):
+                self.добавить_находку('КРИТИЧЕСКИЙ', 'Sudo NOPASSWD',
+                                      "Обнаружены правила sudo без пароля",
+                                      "Удалите NOPASSWD из /etc/sudoers")
+            подозрительные = self.выполнить_команду(['ps', 'aux'])
+            if re.search(r'\[kworker|\[ksoftirqd|\[kthreadd', подозрительные):
+                self.добавить_находку('ВЫСОКИЙ', 'Подозрительные процессы',
+                                      "Обнаружены процессы, маскирующиеся под системные",
+                                      "Проверьте систему антивирусом")
+        except Exception as e:
+            успех = False
+            ошибки_здесь.append(str(e))
+        if успех:
+            self._отметить_статус("Проверка привилегий", True, "")
+        elif ошибки_здесь:
+            self._отметить_статус("Проверка привилегий", False, "; ".join(ошибки_здесь), частично=True)
+        else:
+            self._отметить_статус("Проверка привилегий", False, "")
+
+    # ---------- 6. Аудит журналов ----------
+    def аудит_журналов(self):
+        self._log(f"\n{Colors.BOLD}{Colors.BLUE}[6] Аудит журналов{Colors.END}")
+        успех = True
+        ошибки_здесь = []
+        try:
+            if os.path.exists('/var/log/auth.log'):
+                неудачные = self.выполнить_команду(['grep', 'Failed password', '/var/log/auth.log'], использовать_sudo=True)
+                if неудачные:
+                    self.добавить_находку('ВЫСОКИЙ', 'Неудачные входы',
+                                          "Обнаружены множественные неудачные попытки входа",
+                                          "Проверьте /var/log/auth.log, заблокируйте IP")
+                смена_пароля = self.выполнить_команду(['grep', 'password changed', '/var/log/auth.log'], использовать_sudo=True)
+                if смена_пароля:
+                    self.добавить_находку('СРЕДНИЙ', 'Смена паролей',
+                                          "Недавняя смена паролей пользователей",
+                                          "Убедитесь, что изменения санкционированы")
+            else:
+                журнал = self.выполнить_команду(['sudo', 'journalctl', '-u', 'sshd', '--since', '1 day ago'])
+                if 'Failed password' in журнал:
+                    self.добавить_находку('ВЫСОКИЙ', 'Неудачные входы',
+                                          "Обнаружены неудачные попытки входа (из journalctl)",
+                                          "Проверьте журнал sshd")
+        except Exception as e:
+            успех = False
+            ошибки_здесь.append(str(e))
+        if успех:
+            self._отметить_статус("Аудит журналов", True, "")
+        elif ошибки_здесь:
+            self._отметить_статус("Аудит журналов", False, "; ".join(ошибки_здесь), частично=True)
+        else:
+            self._отметить_статус("Аудит журналов", False, "")
+
+    # ---------- 7. Проверка брандмауэра ----------
+    def проверка_брандмауэра(self):
+        self._log(f"\n{Colors.BOLD}{Colors.BLUE}[7] Проверка брандмауэра{Colors.END}")
+        успех = True
+        ошибки_здесь = []
+        try:
+            ufw_статус = self.выполнить_команду(['ufw', 'status'])
+            if 'inactive' in ufw_статус.lower():
+                self.добавить_находку('КРИТИЧЕСКИЙ', 'Брандмауэр UFW отключён',
+                                      "UFW (Несложный брандмауэр) установлен, но не активен",
+                                      "sudo ufw enable && sudo ufw default deny incoming")
+            elif 'active' in ufw_статус.lower():
+                правила = self.выполнить_команду(['ufw', 'status', 'verbose'])
+                if 'deny' not in правила.lower():
+                    self.добавить_находку('ВЫСОКИЙ', 'Настройки UFW',
+                                          "Правило для входящих не deny",
+                                          "sudo ufw default deny incoming")
+            else:
+                firewalld = self.выполнить_команду(['systemctl', 'is-active', 'firewalld'])
+                if firewalld == 'active':
+                    self._log(f"{Colors.GREEN}[+] firewalld активен{Colors.END}")
+                else:
+                    self.добавить_находку('КРИТИЧЕСКИЙ', 'Брандмауэр отсутствует',
+                                          "Не установлен ни UFW, ни firewalld",
+                                          "sudo apt install ufw && sudo ufw enable")
+        except Exception as e:
+            успех = False
+            ошибки_здесь.append(str(e))
+        if успех:
+            self._отметить_статус("Проверка брандмауэра", True, "")
+        elif ошибки_здесь:
+            self._отметить_статус("Проверка брандмауэра", False, "; ".join(ошибки_здесь), частично=True)
+        else:
+            self._отметить_статус("Проверка брандмауэра", False, "")
+
+    # ---------- 8. Формирование отчёта ----------
+    def сформировать_отчёт(self):
+        длительность = (datetime.now() - self.время_старта).total_seconds()
+
+        # Группируем находки по категориям и критичности
+        сгруппировано_по_категориям = defaultdict(list)
+        сгруппировано_по_критичности = defaultdict(list)
+        for н in self.находки:
+            сгруппировано_по_категориям[н['категория']].append(н)
+            сгруппировано_по_критичности[н['уровень']].append(н)
+
+        # Сортируем категории в логическом порядке
+        порядок_категорий = [
+            'Права 777', 'Права 666', 'SUID-бит', 'SGID-бит',
+            'Конфиденциальные данные', 'История БД', 'Ярлыки меню',
+            'Опасный порт', 'FTP анонимный доступ',
+            'Ядро Linux', 'Уязвимый пакет openssh-server', 'Уязвимый пакет apache2',
+            'Уязвимый пакет nginx', 'Уязвимый пакет mysql-server',
+            'Уязвимый пакет mariadb-server', 'Уязвимый пакет postgresql',
+            'Уязвимый пакет vsftpd', 'Уязвимый пакет samba', 'Уязвимый пакет openssl',
+            'Уязвимый пакет php', 'Уязвимый пакет redis',
+            'Sudo ALL', 'Sudo NOPASSWD', 'Подозрительные процессы',
+            'Неудачные входы', 'Смена паролей',
+            'Брандмауэр UFW отключён', 'Настройки UFW', 'Брандмауэр отсутствует'
+        ]
+        отсортированные_категории = [кат for кат in порядок_категорий if кат in сгруппировано_по_категориям]
+        отсортированные_категории += [кат for кат in сгруппировано_по_категориям.keys() if кат not in отсортированные_категории]
+
+        # Статистика по критичности
+        статистика_критичности = {ур: len(список) for ур, список in сгруппировано_по_критичности.items()}
+
+        # ---------- Фильтрация флагов ----------
+        валидные_флаги = []
+        for ф in self.флаги:
+            if isinstance(ф, str) and ф.startswith('bit26{') and ф.endswith('}'):
+                внутрь = ф[6:-1]
+                # Исключаем мусор
+                if (not any(c in внутрь for c in '"\'[]()') and
+                    not внутрь.startswith('полученный') and
+                    not внутрь.startswith('расшифрованный') and
+                    not внутрь.startswith('флаг') and
+                    not внутрь.endswith('...') and
+                    'f.endswith' not in внутрь and
+                    'флаг.endswith' not in внутрь and
+                    '...' not in внутрь and
+                    len(внутрь) > 3):
+                    валидные_флаги.append(ф)
+        валидные_флаги = sorted(валидные_флаги)
+
+        # ---------- Нерасшифрованные флаги ----------
+        нерасшифрованные = sorted(set(self.нерасшифрованные_флаги))
+
+        # ---------- Статистика по проверкам ----------
+        успешные_проверки = 0
+        частичные_проверки = 0
+        неудачные_проверки = 0
+        for статус, _ in self.статус_проверок.values():
+            if "✅" in статус:
+                успешные_проверки += 1
+            elif "⚠️" in статус:
+                частичные_проверки += 1
+            else:
+                неудачные_проверки += 1
+
+        # ---------- Формируем JSON ----------
+        отчёт = {
+            "информация_о_сканировании": {
+                "версия_аудитора": self.VERSION,
+                "имя_хоста": self.имя_хоста,
+                "имя_компьютера": self.имя_хоста,
+                "пользователь": self.текущий_пользователь,
+                "время_сканирования": self.время_старта.isoformat(),
+                "длительность_сек": round(длительность, 2),
+                "всего_находок": len(self.находки),
+                "всего_флагов": len(валидные_флаги),
+                "всего_нерасшифрованных_флагов": len(нерасшифрованные),
+                "интернет_доступен": self.интернет_доступен,
+                "ошибки": self.ошибки,
+                "статус_проверок": self.статус_проверок,
+                "статистика_по_критичности": статистика_критичности,
+                "статистика_по_проверкам": {
+                    "всего_проверок": len(self.статус_проверок),
+                    "успешно": успешные_проверки,
+                    "частично": частичные_проверки,
+                    "неудачно": неудачные_проверки
+                }
+            },
+            "найденные_флаги": валидные_флаги,
+            "нерасшифрованные_флаги": нерасшифрованные,
+            "находки_по_категориям": {кат: сгруппировано_по_категориям[кат] for кат in отсортированные_категории},
+            "находки_по_критичности": dict(сгруппировано_по_критичности)
+        }
+
+        имя_файла = f"audit_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+        with open(имя_файла, 'w', encoding='utf-8') as f:
+            json.dump(отчёт, f, indent=2, ensure_ascii=False)
+
+        # ---------- КОНСОЛЬНЫЙ ВЫВОД ----------
+        self._log(f"\n{Colors.BOLD}{Colors.GREEN}{'='*80}{Colors.END}")
+        self._log(f"{Colors.BOLD}{Colors.GREEN}║{' '*30}ИТОГОВЫЙ ОТЧЁТ АУДИТА{' '*30}║{Colors.END}")
+        self._log(f"{Colors.BOLD}{Colors.GREEN}{'='*80}{Colors.END}")
+        self._log(f"Хост: {self.имя_хоста} (имя компьютера)")
+        self._log(f"Пользователь: {self.текущий_пользователь}")
+        self._log(f"Время сканирования: {длительность:.2f} сек")
+        self._log(f"Найдено проблем: {len(self.находки)}")
+        self._log(f"Найдено bit26-флагов: {len(валидные_флаги)}")
+        self._log(f"Нерасшифрованных флагов: {len(нерасшифрованные)}")
+
+        # Статистика по критичности
+        if статистика_критичности:
+            self._log(f"\n{Colors.BOLD}📊 Статистика по критичности:{Colors.END}")
+            for уровень, кол in статистика_критичности.items():
+                цвет = {'КРИТИЧЕСКИЙ': Colors.RED, 'ВЫСОКИЙ': Colors.YELLOW, 'СРЕДНИЙ': Colors.BLUE, 'ИНФО': Colors.CYAN}.get(уровень, Colors.END)
+                self._log(f"  {цвет}{уровень}{Colors.END}: {кол}")
+
+        # Статус выполнения проверок
+        self._log(f"\n{Colors.BOLD}🔍 Статус выполнения проверок:{Colors.END}")
+        self._log(f"  Всего проверок: {len(self.статус_проверок)}")
+        self._log(f"  ✅ Успешно: {успешные_проверки}")
+        self._log(f"  ⚠️ Частично: {частичные_проверки}")
+        self._log(f"  ❌ Неудачно: {неудачные_проверки}")
+
+        # Детализация проверок, которые не выполнены полностью
+        if частичные_проверки > 0 or неудачные_проверки > 0:
+            self._log(f"\n{Colors.BOLD}{Colors.YELLOW}⚠ Детализация не полностью выполненных проверок:{Colors.END}")
+            for название, (статус, пояснение) in self.статус_проверок.items():
+                if "✅" not in статус:
+                    self._log(f"  {статус} {название}")
+                    if пояснение:
+                        self._log(f"    {Colors.YELLOW}Причина: {пояснение}{Colors.END}")
+
+        # Ошибки, возникшие во время работы
+        if self.ошибки:
+            self._log(f"\n{Colors.BOLD}{Colors.RED}⚠ Ошибки при выполнении команд:{Colors.END}")
+            for err in self.ошибки:
+                self._log(f"  {Colors.RED}• {err}{Colors.END}")
+
+        # Найденные флаги
+        if валидные_флаги:
+            self._log(f"\n{Colors.BOLD}{Colors.GREEN}🏆 НАЙДЕННЫЕ BIT26-ФЛАГИ (расшифрованные):{Colors.END}")
+            for флаг in валидные_флаги:
+                self._log(f"  {Colors.GREEN}{флаг}{Colors.END}")
+        else:
+            self._log(f"\n{Colors.BOLD}{Colors.YELLOW}🏆 Найденные bit26-флаги (расшифрованные):{Colors.END}")
+            self._log(f"  {Colors.YELLOW}Флаги не обнаружены.{Colors.END}")
+
+        # Нерасшифрованные флаги
+        if нерасшифрованные:
+            self._log(f"\n{Colors.BOLD}{Colors.YELLOW}🔐 ФЛАГИ, ТРЕБУЮЩИЕ РАСШИФРОВКИ:{Colors.END}")
+            for подсказка in нерасшифрованные:
+                self._log(f"  {Colors.YELLOW}{подсказка}{Colors.END}")
+        else:
+            self._log(f"\n{Colors.BOLD}{Colors.YELLOW}🔐 Флаги, требующие расшифровки:{Colors.END}")
+            self._log(f"  {Colors.YELLOW}Нерасшифрованные флаги не обнаружены.{Colors.END}")
+
+        # Сообщение о сохранении JSON
+        self._log(f"\n{Colors.BOLD}{Colors.CYAN}📄 Полный отчёт сохранён в файл:{Colors.END} {имя_файла}")
+
+        if not self.no_color and self.gui_callback is None:
+            self._log(f"\n{Colors.BOLD}💡 Совет:{Colors.END} Для просмотра отчёта в удобном виде откройте файл {имя_файла} любым текстовым редактором.")
+
+    # ---------- Запуск всех проверок ----------
+    def запустить_всё(self):
+        self._log(BANNER)
+        self._log(f"{Colors.CYAN}Запуск полного аудита безопасности...{Colors.END}\n")
+
+        self.аудит_прав()
+        self.аудит_сети()
+        self.аудит_пакетов()
+        self.поиск_флагов()
+        self.проверка_привилегий()
+        self.аудит_журналов()
+        self.проверка_брандмауэра()
+        self.сформировать_отчёт()
+
+# ---------- GUI на Tkinter (улучшенная) ----------
+def запустить_gui():
+    try:
+        import tkinter as tk
+        from tkinter import scrolledtext, messagebox, ttk
+    except ImportError:
+        print("Tkinter не установлен. Используйте CLI режим.")
+        return
+
+    root = tk.Tk()
+    root.title("ITBur Cyber Auditor v6.3 — Графический интерфейс пользователя (GUI)")
+    root.geometry("1000x750")
+    root.resizable(True, True)
+
+    # Основной фрейм
+    main_frame = ttk.Frame(root, padding="10")
+    main_frame.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+    root.columnconfigure(0, weight=1)
+    root.rowconfigure(0, weight=1)
+    main_frame.columnconfigure(0, weight=1)
+    main_frame.rowconfigure(0, weight=1)
+
+    # Заголовок
+    title = ttk.Label(main_frame, text="ITBur Cyber Auditor v6.3", font=("Arial", 16, "bold"))
+    title.grid(row=0, column=0, pady=5)
+
+    # Область вывода
+    output_area = scrolledtext.ScrolledText(main_frame, wrap=tk.WORD, width=100, height=30, font=("Courier", 10))
+    output_area.grid(row=1, column=0, sticky=(tk.W, tk.E, tk.N, tk.S), pady=10)
+
+    # Функция для вывода в GUI
+    def gui_write(message):
+        output_area.insert(tk.END, message + "\n")
+        output_area.see(tk.END)
+        root.update_idletasks()
+
+    # Панель кнопок
+    button_frame = ttk.Frame(main_frame)
+    button_frame.grid(row=2, column=0, pady=5)
+
+    def run_audit():
+        output_area.delete(1.0, tk.END)
+        gui_write("Запуск аудита...\n")
+        def target():
+            auditor = ITBurCyberAuditor(no_color=True, gui_callback=gui_write)
+            auditor.запустить_всё()
+            gui_write("\nАудит завершён.")
+        threading.Thread(target=target, daemon=True).start()
+
+    ttk.Button(button_frame, text="Запустить полный аудит", command=run_audit).pack(side=tk.LEFT, padx=5)
+
+    def clear_output():
+        output_area.delete(1.0, tk.END)
+    ttk.Button(button_frame, text="Очистить вывод", command=clear_output).pack(side=tk.LEFT, padx=5)
+
+    # Строка статуса
+    status_var = tk.StringVar()
+    status_var.set("Готов к работе. Нажмите кнопку для запуска аудита.")
+    status_bar = ttk.Label(main_frame, textvariable=status_var, relief=tk.SUNKEN, anchor=tk.W)
+    status_bar.grid(row=3, column=0, sticky=(tk.W, tk.E), pady=5)
+
+    root.mainloop()
+
+# ---------- Обработчик прерывания ----------
+def обработчик_прерывания(sig, frame):
+    print(f"\n{Colors.YELLOW}Прерывание пользователем. Сохраняю найденные результаты...{Colors.END}")
+    if 'auditor' in globals():
+        auditor.сформировать_отчёт()
+    sys.exit(0)
+
+# ---------- Проверка зависимостей ----------
+def проверить_зависимости():
+    missing = []
+    try:
+        import packaging
+    except ImportError:
+        missing.append("packaging")
+    if missing:
+        print(f"{Colors.YELLOW}⚠ Отсутствуют необходимые Python-пакеты: {', '.join(missing)}{Colors.END}")
+        print(f"Установите их командой: pip install {' '.join(missing)}")
+        print("Затем перезапустите скрипт.")
+        sys.exit(1)
+
+# ---------- Точка входа ----------
+if __name__ == "__main__":
+    проверить_зависимости()
+
+    # Парсер аргументов командной строки
+    parser = argparse.ArgumentParser(description='ITBur Cyber Auditor - инструмент аудита безопасности Linux')
+    parser.add_argument('--no-color', action='store_true', help='Отключить цветной вывод')
+    parser.add_argument('--check', nargs='+', choices=['file_perm', 'network', 'packages', 'flags', 'privileges', 'logs', 'firewall', 'all'],
+                        help='Выборочные проверки (по умолчанию all)')
+    parser.add_argument('--gui', action='store_true', help='Запустить графический интерфейс')
+    args = parser.parse_args()
+
+    signal.signal(signal.SIGINT, обработчик_прерывания)
+
+    # Если запрошен GUI или нет аргументов и tkinter доступен
+    if args.gui or (len(sys.argv) == 1 and '--help' not in sys.argv):
+        try:
+            import tkinter
+            запустить_gui()
+            sys.exit(0)
+        except ImportError:
+            print("Tkinter не установлен. Запуск в CLI режиме.")
+            # продолжим CLI
+
+    # CLI режим
+    if os.geteuid() != 0:
+        print(f"{Colors.YELLOW}Для полного аудита рекомендуется запуск с sudo.{Colors.END}\n")
+
+    auditor = ITBurCyberAuditor(no_color=args.no_color)
+
+    # Выборочный запуск проверок
+    checks = args.check if args.check else ['all']
+    if 'all' in checks:
+        auditor.запустить_всё()
+    else:
+        if 'file_perm' in checks:
+            auditor.аудит_прав()
+        if 'network' in checks:
+            auditor.аудит_сети()
+        if 'packages' in checks:
+            auditor.аудит_пакетов()
+        if 'flags' in checks:
+            auditor.поиск_флагов()
+        if 'privileges' in checks:
+            auditor.проверка_привилегий()
+        if 'logs' in checks:
+            auditor.аудит_журналов()
+        if 'firewall' in checks:
+            auditor.проверка_брандмауэра()
+        auditor.сформировать_отчёт()
